@@ -19,6 +19,13 @@ class LayerNorm(nn.Module):
     """层归一化模块，支持可选的偏置参数。PyTorch原生LayerNorm不直接支持关闭偏置，此实现解决了该问题。"""
     
     def __init__(self, ndim, bias):
+        """
+        初始化层归一化模块。
+
+        参数:
+        ndim (int): 归一化的维度，通常为输入特征的维度。
+        bias (bool): 是否使用偏置参数。True 表示使用，False 表示不使用。
+        """
         super().__init__()
         # 初始化可训练的权重参数，形状为 (ndim,)，初始值全为 1。该权重用于对归一化后的输入进行缩放。
         self.weight = nn.Parameter(torch.ones(ndim))
@@ -48,49 +55,86 @@ class CausalSelfAttention(nn.Module):
     """因果自注意力机制模块，确保序列中每个位置只能关注其前面的位置，防止信息泄露。支持Flash Attention加速（需PyTorch >= 2.0）。"""
 
     def __init__(self, config):
+        """
+        初始化因果自注意力模块。
+
+        参数:
+        config: 包含模型配置参数的对象，需包含以下属性：
+            n_embd (int): 嵌入维度，即输入特征的维度。
+            n_head (int): 注意力头的数量，需整除嵌入维度。
+            block_size (int): 序列长度，用于生成因果掩码。
+            dropout (float): dropout概率，用于正则化。
+            bias (bool): 是否在线性层中使用偏置。
+        """
         super().__init__()
+        # 确保嵌入维度能被头数整除，保证每个头的维度一致
         assert config.n_embd % config.n_head == 0
-        # key, query, value projections for all heads, but in a batch
+        # 一次性对所有头的key、query、value进行线性投影，将输入维度映射到3倍的嵌入维度
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
-        # output projection
+        # 对自注意力的输出进行线性投影，将维度恢复到原始的嵌入维度
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
-        # regularization
+        # 对注意力分数进行dropout操作，防止过拟合
         self.attn_dropout = nn.Dropout(config.dropout)
+        # 对自注意力的输出进行dropout操作，防止过拟合
         self.resid_dropout = nn.Dropout(config.dropout)
+        # 记录注意力头的数量
         self.n_head = config.n_head
+        # 记录嵌入维度
         self.n_embd = config.n_embd
+        # 记录dropout概率
         self.dropout = config.dropout
-        # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
+        # 检查当前PyTorch版本是否支持Flash Attention
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
         if not self.flash:
             print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
-            # causal mask to ensure that attention is only applied to the left in the input sequence
+            # 创建因果掩码，确保每个位置只能关注其前面的位置
+            # 使用下三角矩阵生成掩码，保证注意力只作用于输入序列的左侧
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
 
     def forward(self, x):
-        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+        # 获取输入张量的批次大小、序列长度和嵌入维度
+        B, T, C = x.size()  # batch size, sequence length, embedding dimensionality (n_embd)
 
-        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        # 通过线性投影计算所有头的query、key、value，并将其分割
+        # 然后调整形状，将头的维度提前作为批次维度
+        # 通过 self.c_attn 线性层对输入 x 进行投影，将输入维度映射到 3 倍的嵌入维度。
+        # 然后使用 split 方法，沿着维度 2（特征维度）将投影结果分割为三个部分，
+        # 分别赋值给查询（query）、键（key）和值（value）张量，每个部分的维度为嵌入维度 n_embd。
         q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        # 将key的形状调整为 (B, nh, T, hs)，其中nh为头数，hs为每个头的维度
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
+        # 将query的形状调整为 (B, nh, T, hs)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
+        # 将value的形状调整为 (B, nh, T, hs)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
 
-        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
+        # 执行因果自注意力操作
+        # Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
-            # efficient attention using Flash Attention CUDA kernels
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+            # 使用Flash Attention的CUDA内核实现高效的注意力计算
+            y = torch.nn.functional.scaled_dot_product_attention(
+                q, k, v, 
+                attn_mask=None, 
+                dropout_p=self.dropout if self.training else 0, 
+                is_causal=True
+            )
         else:
-            # manual implementation of attention
+            # 手动实现注意力机制
+            # 计算query和key的点积，并进行缩放
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+            # 使用因果掩码，将掩码值为0的位置的注意力分数置为负无穷
             att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+            # 对注意力分数进行softmax操作，得到注意力分布
             att = F.softmax(att, dim=-1)
+            # 对注意力分布进行dropout操作
             att = self.attn_dropout(att)
-            y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+            # 根据注意力分布对value进行加权求和
+            y = att @ v  # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        # 将头的维度移回原来的位置，并重新拼接所有头的输出
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
 
-        # output projection
+        # 对自注意力的输出进行线性投影，并应用dropout
         y = self.resid_dropout(self.c_proj(y))
         return y
 
@@ -216,9 +260,9 @@ class GPT(nn.Module):
         return logits, loss
 
     def crop_block_size(self, block_size):
-        # model surgery to decrease the block size if necessary
-        # e.g. we may load the GPT2 pretrained model checkpoint (block size 1024)
-        # but want to use a smaller block size for some smaller, simpler model
+        # 必要时对模型进行修改以减小块大小
+        # 例如，我们可能加载了 GPT2 预训练模型检查点（块大小为 1024）
+        # 但希望为一些更小、更简单的模型使用更小的块大小
         assert block_size <= self.config.block_size
         self.config.block_size = block_size
         self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
