@@ -16,17 +16,36 @@ import torch.nn as nn
 from torch.nn import functional as F
 
 class LayerNorm(nn.Module):
-    """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
-
+    """层归一化模块，支持可选的偏置参数。PyTorch原生LayerNorm不直接支持关闭偏置，此实现解决了该问题。"""
+    
     def __init__(self, ndim, bias):
         super().__init__()
+        # 初始化可训练的权重参数，形状为 (ndim,)，初始值全为 1。该权重用于对归一化后的输入进行缩放。
         self.weight = nn.Parameter(torch.ones(ndim))
+        # 根据 bias 参数决定是否初始化可训练的偏置参数。
+        # 若 bias 为 True，则初始化形状为 (ndim,) 且初始值全为 0 的偏置参数；
+        # 若 bias 为 False，则不初始化偏置参数，将其设为 None。
         self.bias = nn.Parameter(torch.zeros(ndim)) if bias else None
 
     def forward(self, input):
+        """
+        前向传播方法，对输入进行层归一化操作。
+
+        参数:
+        input (torch.Tensor): 输入张量，需要进行层归一化的输入数据。
+        返回:
+        torch.Tensor: 经过层归一化处理后的张量。
+        """
+        # 使用 PyTorch 的 layer_norm 函数进行层归一化操作
+        # input: 输入张量，即需要进行归一化处理的数据
+        # self.weight.shape: 归一化的形状，使用权重的形状作为归一化的维度
+        # self.weight: 可学习的权重参数，用于对归一化后的输入进行缩放
+        # self.bias: 可学习的偏置参数，若初始化时未启用则为 None
+        # 1e-5: 数值稳定性的小常数，防止分母为零
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
 class CausalSelfAttention(nn.Module):
+    """因果自注意力机制模块，确保序列中每个位置只能关注其前面的位置，防止信息泄露。支持Flash Attention加速（需PyTorch >= 2.0）。"""
 
     def __init__(self, config):
         super().__init__()
@@ -76,6 +95,7 @@ class CausalSelfAttention(nn.Module):
         return y
 
 class MLP(nn.Module):
+    """多层感知机模块，包含两个线性变换和GELU激活函数，用于Transformer块中的前馈网络部分。"""
 
     def __init__(self, config):
         super().__init__()
@@ -92,6 +112,7 @@ class MLP(nn.Module):
         return x
 
 class Block(nn.Module):
+    """Transformer块模块，由层归一化、因果自注意力机制和多层感知机组成，包含残差连接。"""
 
     def __init__(self, config):
         super().__init__()
@@ -107,6 +128,7 @@ class Block(nn.Module):
 
 @dataclass
 class GPTConfig:
+    """GPT模型配置类，存储模型的超参数，如序列长度、词汇表大小、层数、头数和嵌入维度等。"""
     block_size: int = 1024
     vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
     n_layer: int = 12
@@ -116,6 +138,7 @@ class GPTConfig:
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
 
 class GPT(nn.Module):
+    """GPT语言模型主类，包含完整的Transformer架构，支持文本生成和预训练权重加载。实现了前向传播、优化器配置和文本生成等核心功能。"""
 
     def __init__(self, config):
         super().__init__()
