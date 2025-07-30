@@ -69,7 +69,7 @@ class CausalSelfAttention(nn.Module):
         super().__init__()
         # 确保嵌入维度能被头数整除，保证每个头的维度一致
         assert config.n_embd % config.n_head == 0
-        # 一次性对所有头的key、query、value进行线性投影，将输入维度映射到3倍的嵌入维度
+        # 一次性对所有头的key、query、value进行线性投影，将输入维度映射到3倍的嵌入维度，nn.Linear 只对输入张量的最后一个维度进行操作
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
         # 对自注意力的输出进行线性投影，将维度恢复到原始的嵌入维度
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
@@ -94,22 +94,31 @@ class CausalSelfAttention(nn.Module):
 
     def forward(self, x):
         # 获取输入张量的批次大小、序列长度和嵌入维度
-        B, T, C = x.size()  # batch size, sequence length, embedding dimensionality (n_embd)
-
+        B, T, C = x.size()  # batch size = 12, sequence length = 1024, embedding dimensionality (n_embd = 768)
+       
         # 通过线性投影计算所有头的query、key、value，并将其分割
         # 然后调整形状，将头的维度提前作为批次维度
         # 通过 self.c_attn 线性层对输入 x 进行投影，将输入维度映射到 3 倍的嵌入维度。
         # 然后使用 split 方法，沿着维度 2（特征维度）将投影结果分割为三个部分，
         # 分别赋值给查询（query）、键（key）和值（value）张量，每个部分的维度为嵌入维度 n_embd。
-        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
+
+        # x = self.c_attn(x)的结果是 torch.Size([12, 1024, 2304])
+        # 再将x 切割为 q, k, v  
+        # q.size() = torch.Size([12, 1024, 768])
+        # k.size() = torch.Size([12, 1024, 768])
+        # v.size() = torch.Size([12, 1024, 768])
+        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2) # 在维度2上切割，将2304切割为3个768
         # 将key的形状调整为 (B, nh, T, hs)，其中nh为头数，hs为每个头的维度
+        # n_head = 12
+        # k,view的结果是torch.Size([12, 1024, 12, 64]) ，一共12个头，每个头处理64维的嵌入向量
+        # 将维度交换，调用transpose函数得到：torch.Size([12, 12, 1024, 64])
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
         # 将query的形状调整为 (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
         # 将value的形状调整为 (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
 
-        # 执行因果自注意力操作
+        # 执行自注意力操作
         # Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
             # 使用Flash Attention的CUDA内核实现高效的注意力计算
@@ -121,9 +130,12 @@ class CausalSelfAttention(nn.Module):
             )
         else:
             # 手动实现注意力机制
-            # 计算query和key的点积，并进行缩放
+            # q = Tensor([12, 12, 1024, 64])
+            # k.transpose = Tensor([12, 12, 64, 1024])
+            # att = Tensor([12, 12, 1024, 1024])
+            # 计算query和key的点积，并进行缩放 k.size(-1) = 64
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            # 使用因果掩码，将掩码值为0的位置的注意力分数置为负无穷
+            # 使用掩码，将掩码值为0的位置的注意力分数置为负无穷
             att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
             # 对注意力分数进行softmax操作，得到注意力分布
             att = F.softmax(att, dim=-1)
@@ -173,7 +185,7 @@ class Block(nn.Module):
 @dataclass
 class GPTConfig:
     """GPT模型配置类，存储模型的超参数，如序列长度、词汇表大小、层数、头数和嵌入维度等。"""
-    block_size: int = 1024
+    block_size: int = 1024 # 序列长度
     vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
     n_layer: int = 12
     n_head: int = 12
