@@ -1,19 +1,19 @@
 """
-This training script can be run both on a single gpu in debug mode,
-and also in a larger training run with distributed data parallel (ddp).
+此训练脚本既可以在单块 GPU 上以调试模式运行，
+也可以在使用分布式数据并行 (DDP) 的大规模训练中运行。
 
-To run on a single GPU, example:
+在单块 GPU 上运行的示例：
 $ python train.py --batch_size=32 --compile=False
 
-To run with DDP on 4 gpus on 1 node, example:
+在 1 个节点的 4 块 GPU 上使用 DDP 运行的示例：
 $ torchrun --standalone --nproc_per_node=4 train.py
 
-To run with DDP on 4 gpus across 2 nodes, example:
-- Run on the first (master) node with example IP 123.456.123.456:
+在 2 个节点的 4 块 GPU 上使用 DDP 运行的示例：
+- 在第一个（主）节点上运行，示例 IP 为 123.456.123.456：
 $ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=0 --master_addr=123.456.123.456 --master_port=1234 train.py
-- Run on the worker node:
+- 在工作节点上运行：
 $ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=123.456.123.456 --master_port=1234 train.py
-(If your cluster does not have Infiniband interconnect prepend NCCL_IB_DISABLE=1)
+（如果你的集群没有 Infiniband 互连，请在命令前添加 NCCL_IB_DISABLE=1）
 """
 
 import os

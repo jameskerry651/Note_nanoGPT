@@ -111,8 +111,8 @@ class CausalSelfAttention(nn.Module):
         # 将key的形状调整为 (B, nh, T, hs)，其中nh为头数，hs为每个头的维度
         # n_head = 12
         # k,view的结果是torch.Size([12, 1024, 12, 64]) ，一共12个头，每个头处理64维的嵌入向量
-        # 将维度交换，调用transpose函数得到：torch.Size([12, 12, 1024, 64])
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
+        # 将维度交换，调用transpose函数得到：
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # torch.Size([12, 12, 1024, 64])
         # 将query的形状调整为 (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
         # 将value的形状调整为 (B, nh, T, hs)
@@ -132,7 +132,6 @@ class CausalSelfAttention(nn.Module):
             # 手动实现注意力机制
             # q = Tensor([12, 12, 1024, 64])
             # k.transpose = Tensor([12, 12, 64, 1024])
-            # att = Tensor([12, 12, 1024, 1024])
             # 计算query和key的点积，并进行缩放 k.size(-1) = 64
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
             # 使用掩码，将掩码值为0的位置的注意力分数置为负无穷
@@ -140,14 +139,17 @@ class CausalSelfAttention(nn.Module):
             # 对注意力分数进行softmax操作，得到注意力分布
             att = F.softmax(att, dim=-1)
             # 对注意力分布进行dropout操作
-            att = self.attn_dropout(att)
+            att = self.attn_dropout(att) # att = Tensor([12, 12, 1024, 1024])
             # 根据注意力分布对value进行加权求和
-            y = att @ v  # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+            y = att @ v  # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)  y = Tensor([12, 12, 1024, 64])
         # 将头的维度移回原来的位置，并重新拼接所有头的输出
-        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        # contiguous() 函数用于确保张量在内存中是连续的，这在进行视图操作（如 view()）时是必要的。
+        # y.transpose(1, 2) 会将维度 1 和 2 进行交换，结果的形状为 (B, T, nh, hs)= (12, 1024, 12, 64)。
+        # view(B, T, C) 会将张量重新形状为 (B, T, C)，其中 C 是所有头的维度拼接后的结果。
+        y = y.transpose(1, 2).contiguous().view(B, T, C) # y = Tensor([12, 1024, 768])
 
         # 对自注意力的输出进行线性投影，并应用dropout
-        y = self.resid_dropout(self.c_proj(y))
+        y = self.resid_dropout(self.c_proj(y)) # y = Tensor([12, 1024, 768]) ,这里只是线性投影，没有激活函数，不改变嵌入维度
         return y
 
 class MLP(nn.Module):
@@ -187,7 +189,7 @@ class GPTConfig:
     """GPT模型配置类，存储模型的超参数，如序列长度、词汇表大小、层数、头数和嵌入维度等。"""
     block_size: int = 1024 # 序列长度
     vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
-    n_layer: int = 12
+    n_layer: int = 12 # block的数量
     n_head: int = 12
     n_embd: int = 768
     dropout: float = 0.0
@@ -202,18 +204,29 @@ class GPT(nn.Module):
         assert config.block_size is not None
         self.config = config
 
+        # 使用 nn.ModuleDict 构建 Transformer 模块字典，方便管理模型的各个组件
         self.transformer = nn.ModuleDict(dict(
+            # 词元嵌入层（Word Token Embedding），将输入的词元索引转换为词向量
+            # config.vocab_size 为词汇表大小，config.n_embd 为嵌入维度
             wte = nn.Embedding(config.vocab_size, config.n_embd),
+            # 位置嵌入层（Word Position Embedding），为输入序列中的每个位置生成位置向量
+            # config.block_size 为序列最大长度，config.n_embd 为嵌入维度
             wpe = nn.Embedding(config.block_size, config.n_embd),
+            # Dropout 层，用于在训练过程中随机将部分元素置为 0，防止过拟合
+            # config.dropout 为 Dropout 概率
             drop = nn.Dropout(config.dropout),
+            # 堆叠的 Transformer 块，使用 nn.ModuleList 管理多个 Block 实例
+            # config.n_layer 为 Transformer 块的数量
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            # 最终的层归一化层（Final Layer Normalization），对 Transformer 块的输出进行归一化
+            # config.n_embd 为归一化的维度，config.bias 决定是否使用偏置
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        # with weight tying when using torch.compile() some warnings get generated:
-        # "UserWarning: functional_call was passed multiple values for tied weights.
-        # This behavior is deprecated and will be an error in future versions"
-        # not 100% sure what this is, so far seems to be harmless. TODO investigate
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False) # 线性层，将嵌入维度映射到词汇表大小
+        # 使用权重绑定（weight tying）时，使用 torch.compile() 会产生一些警告：
+        # "UserWarning: functional_call 被传入了多个绑定权重的值。
+        # 此行为已被弃用，未来版本中将报错"
+        # 目前还不完全清楚这是什么问题，到目前为止似乎没有危害。TODO: 调查此问题
         self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
 
         # init all weights
@@ -228,10 +241,9 @@ class GPT(nn.Module):
 
     def get_num_params(self, non_embedding=True):
         """
-        Return the number of parameters in the model.
-        For non-embedding count (default), the position embeddings get subtracted.
-        The token embeddings would too, except due to the parameter sharing these
-        params are actually used as weights in the final layer, so we include them.
+        返回模型中的参数数量。
+        对于非嵌入参数计数（默认情况），位置嵌入参数会被减去。
+        原本词元嵌入参数也会被减去，但由于参数共享，这些参数实际上被用作最后一层的权重，因此我们将它们包含在内。
         """
         n_params = sum(p.numel() for p in self.parameters())
         if non_embedding:
@@ -247,26 +259,37 @@ class GPT(nn.Module):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(self, idx, targets=None):
-        device = idx.device
+        """
+        前向传播函数，计算模型的输出和损失（如果提供了目标值）。
+        参数：
+        - idx: 输入的词元索引张量，形状为 (b, t)，其中 b 为批次大小，t 为序列长度。
+        - targets: 可选的目标值张量，形状为 (b, t)，用于计算损失。
+        返回：
+        - logits: 模型的输出张量，形状为 (b, t, vocab_size)，其中 vocab_size 为词汇表大小。
+        - loss: 如果提供了目标值，返回计算得到的损失值；否则返回 None。
+        """
+        device = idx.device # 获取输入张量的设备
+        # 示例：如果 idx 是 [[10, 25, 4], [31, 19, 88]]，那么 b=2, t=3。
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
+        # 这个 `pos` 张量 (`[0, 1, 2, ..., t-1]`) 就是每个词元的位置标签
+        pos = torch.arange(0, t, dtype=torch.long, device=device) # 形状为 (t)
 
-        # forward the GPT model itself
-        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
+        # 前向传播GPT模型本身
+        tok_emb = self.transformer.wte(idx) # 词元嵌入，形状为 (b, t, n_embd)
+        pos_emb = self.transformer.wpe(pos) # 位置嵌入，形状为 (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
         for block in self.transformer.h:
             x = block(x)
-        x = self.transformer.ln_f(x)
+        x = self.transformer.ln_f(x) # x = Tensor of shape (b, t, n_embd)
 
         if targets is not None:
-            # if we are given some desired targets also calculate the loss
-            logits = self.lm_head(x)
+            # 如果提供了目标值，同时计算损失
+            logits = self.lm_head(x) # 线性层，将嵌入维度映射到词汇表大小,形状为 (b, t, vocab_size), vocab_size: int = 50304 
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
-            # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
+            # 推理时的小型优化：仅对最后一个位置进行lm_head前向传播
+            logits = self.lm_head(x[:, [-1], :]) # 注意：使用列表 [-1] 以保留时间维度
             loss = None
 
         return logits, loss
@@ -366,9 +389,9 @@ class GPT(nn.Module):
         return optimizer
 
     def estimate_mfu(self, fwdbwd_per_iter, dt):
-        """ estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS """
-        # first estimate the number of flops we do per iteration.
-        # see PaLM paper Appendix B as ref: https://arxiv.org/abs/2204.02311
+        """ 以 A100 GPU 的 bfloat16 峰值浮点运算次数（FLOPS）为单位，估算模型的浮点运算利用率（MFU） """
+        # 首先估算每次迭代的浮点运算次数。
+        # 参考 PaLM 论文附录 B：https://arxiv.org/abs/2204.02311
         N = self.get_num_params()
         cfg = self.config
         L, H, Q, T = cfg.n_layer, cfg.n_head, cfg.n_embd//cfg.n_head, cfg.block_size
@@ -384,26 +407,27 @@ class GPT(nn.Module):
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
         """
-        Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
-        the sequence max_new_tokens times, feeding the predictions back into the model each time.
-        Most likely you'll want to make sure to be in model.eval() mode of operation for this.
+        给定一个条件索引序列 idx(形状为 (b,t) 的 LongTensor),
+        该函数会根据条件序列生成 max_new_tokens 个新的标记，
+        并将生成的标记反馈到模型中，以进行下一次预测。
+        通常,在使用此函数时,模型应该处于评估模式(model.eval()）。
         """
         for _ in range(max_new_tokens):
-            # if the sequence context is growing too long we must crop it at block_size
+            # 如果序列上下文变得过长，我们必须将其裁剪为 block_size 的长度
             idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
-            # forward the model to get the logits for the index in the sequence
+            # 前向传播模型，获取序列中索引对应的 logits
             logits, _ = self(idx_cond)
-            # pluck the logits at the final step and scale by desired temperature
+            # 提取最后一步的 logits，并按所需的温度系数进行缩放
             logits = logits[:, -1, :] / temperature
-            # optionally crop the logits to only the top k options
+            # 可选操作：将 logits 裁剪为仅保留前 k 个选项
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                 logits[logits < v[:, [-1]]] = -float('Inf')
-            # apply softmax to convert logits to (normalized) probabilities
+            # 应用 softmax 函数，将 logits 转换为（归一化的）概率
             probs = F.softmax(logits, dim=-1)
-            # sample from the distribution
+            # 从概率分布中采样
             idx_next = torch.multinomial(probs, num_samples=1)
-            # append sampled index to the running sequence and continue
+            # 将采样得到的索引追加到当前序列中，然后继续生成
             idx = torch.cat((idx, idx_next), dim=1)
 
         return idx
