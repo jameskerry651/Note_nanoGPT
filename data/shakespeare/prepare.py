@@ -4,6 +4,8 @@ import tiktoken
 import numpy as np
 
 # download the tiny shakespeare dataset
+# 此代码行用于构建输入文件的完整路径。os.path.dirname(__file__) 获取当前脚本所在的目录路径，
+# 然后使用 os.path.join 将该目录路径与 'input.txt' 文件名拼接起来，最终得到输入文件的完整路径。
 input_file_path = os.path.join(os.path.dirname(__file__), 'input.txt')
 if not os.path.exists(input_file_path):
     data_url = 'https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt'
@@ -12,7 +14,9 @@ if not os.path.exists(input_file_path):
 
 with open(input_file_path, 'r', encoding='utf-8') as f:
     data = f.read()
+# 计算数据长度
 n = len(data)
+# 划分训练集和验证集
 train_data = data[:int(n*0.9)]
 val_data = data[int(n*0.9):]
 
