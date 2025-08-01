@@ -300,6 +300,9 @@ class GPT(nn.Module):
         # 但希望为一些更小、更简单的模型使用更小的块大小
         assert block_size <= self.config.block_size
         self.config.block_size = block_size
+        # 裁剪位置嵌入层（wpe）的权重张量，仅保留前 block_size 个位置的嵌入向量。
+        # 此操作是为了将模型的最大序列长度调整为新的 block_size。
+        # 通过将权重张量切片并重新封装为 nn.Parameter，更新位置嵌入层的权重。
         self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
         for block in self.transformer.h:
             if hasattr(block.attn, 'bias'):
@@ -308,54 +311,59 @@ class GPT(nn.Module):
     @classmethod
     def from_pretrained(cls, model_type, override_args=None):
         assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
-        override_args = override_args or {} # default to empty dict
-        # only dropout can be overridden see more notes below
+        override_args = override_args or {} # 默认空字典
+        # 只有 dropout 可以被覆盖，更多细节见下文
         assert all(k == 'dropout' for k in override_args)
         from transformers import GPT2LMHeadModel
-        print("loading weights from pretrained gpt: %s" % model_type)
+        print("从预训练的 GPT 模型加载权重: %s" % model_type)
 
-        # n_layer, n_head and n_embd are determined from model_type
+        # n_layer、n_head 和 n_embd 由 model_type 决定
         config_args = {
-            'gpt2':         dict(n_layer=12, n_head=12, n_embd=768),  # 124M params
-            'gpt2-medium':  dict(n_layer=24, n_head=16, n_embd=1024), # 350M params
-            'gpt2-large':   dict(n_layer=36, n_head=20, n_embd=1280), # 774M params
-            'gpt2-xl':      dict(n_layer=48, n_head=25, n_embd=1600), # 1558M params
+            'gpt2':         dict(n_layer=12, n_head=12, n_embd=768),  # 1.24 亿参数
+            'gpt2-medium':  dict(n_layer=24, n_head=16, n_embd=1024), # 3.5 亿参数
+            'gpt2-large':   dict(n_layer=36, n_head=20, n_embd=1280), # 7.74 亿参数
+            'gpt2-xl':      dict(n_layer=48, n_head=25, n_embd=1600), # 15.58 亿参数
         }[model_type]
-        print("forcing vocab_size=50257, block_size=1024, bias=True")
-        config_args['vocab_size'] = 50257 # always 50257 for GPT model checkpoints
-        config_args['block_size'] = 1024 # always 1024 for GPT model checkpoints
-        config_args['bias'] = True # always True for GPT model checkpoints
-        # we can override the dropout rate, if desired
+        print("强制设置 vocab_size=50257, block_size=1024, bias=True")
+        config_args['vocab_size'] = 50257 # GPT 模型检查点的词汇表大小始终为 50257
+        config_args['block_size'] = 1024 # GPT 模型检查点的块大小始终为 1024
+        config_args['bias'] = True # GPT 模型检查点的偏置始终为 True
+        # 如果需要，可以覆盖 dropout 率
         if 'dropout' in override_args:
-            print(f"overriding dropout rate to {override_args['dropout']}")
+            print(f"将 dropout 率覆盖为 {override_args['dropout']}")
             config_args['dropout'] = override_args['dropout']
-        # create a from-scratch initialized minGPT model
+        # 创建一个从头初始化的 minGPT 模型
+        # 使用之前配置好的参数字典 config_args 初始化 GPTConfig 实例，该实例包含了模型的各项超参数
         config = GPTConfig(**config_args)
+        # 根据 GPTConfig 实例创建一个全新的 GPT 模型实例
         model = GPT(config)
+        # 获取新创建模型的状态字典，该字典包含了模型所有可训练参数的张量
         sd = model.state_dict()
+        # 获取状态字典中的所有键名，这些键名对应着模型中各个参数的名称
         sd_keys = sd.keys()
-        sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')] # discard this mask / buffer, not a param
+        # 过滤掉状态字典键名中以 '.attn.bias' 结尾的键，因为这些是掩码或缓冲区，并非模型的可训练参数
+        sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')]
 
-        # init a huggingface/transformers model
+        # 初始化一个 huggingface/transformers 模型
         model_hf = GPT2LMHeadModel.from_pretrained(model_type)
         sd_hf = model_hf.state_dict()
 
-        # copy while ensuring all of the parameters are aligned and match in names and shapes
+        # 在复制参数时，确保所有参数的名称和形状都对齐且匹配
         sd_keys_hf = sd_hf.keys()
-        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')] # ignore these, just a buffer
-        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')] # same, just the mask (buffer)
+        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')]  # 忽略这些，它们只是缓冲区
+        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')]  # 同样，只是掩码（缓冲区）
         transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
-        # basically the openai checkpoints use a "Conv1D" module, but we only want to use a vanilla Linear
-        # this means that we have to transpose these weights when we import them
+        # 基本上 OpenAI 的检查点使用的是 "Conv1D" 模块，但我们只想使用普通的 Linear 模块
+        # 这意味着在导入这些权重时，我们需要对它们进行转置
         assert len(sd_keys_hf) == len(sd_keys), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
         for k in sd_keys_hf:
             if any(k.endswith(w) for w in transposed):
-                # special treatment for the Conv1D weights we need to transpose
+                # 对 Conv1D 权重进行特殊处理，需要进行转置
                 assert sd_hf[k].shape[::-1] == sd[k].shape
                 with torch.no_grad():
                     sd[k].copy_(sd_hf[k].t())
             else:
-                # vanilla copy over the other parameters
+                # 对其他参数进行普通复制
                 assert sd_hf[k].shape == sd[k].shape
                 with torch.no_grad():
                     sd[k].copy_(sd_hf[k])
@@ -363,27 +371,49 @@ class GPT(nn.Module):
         return model
 
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
-        # start with all of the candidate parameters
+        """
+        配置模型的优化器，使用 AdamW 优化算法，并根据条件选择是否使用融合版本。
+        将模型参数分为需要权重衰减和不需要权重衰减的两组，分别进行不同的优化设置。
+
+        参数:
+        weight_decay (float): 权重衰减系数，用于正则化。
+        learning_rate (float): 学习率，控制参数更新的步长。
+        betas (tuple): AdamW 优化器的动量参数，通常为 (beta1, beta2)。
+        device_type (str): 设备类型，如 'cuda' 或 'cpu'，用于判断是否使用融合版本的优化器。
+
+        返回:
+        torch.optim.AdamW: 配置好的 AdamW 优化器实例。
+        """
+        # 从所有候选参数开始，获取模型中所有参数的名称和对应的张量
         param_dict = {pn: p for pn, p in self.named_parameters()}
-        # filter out those that do not require grad
+        # 过滤掉不需要梯度的参数，只保留需要更新的参数
         param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
-        # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
-        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
+        # 创建优化器参数组。根据参数的维度决定是否进行权重衰减，任何二维及以上的参数都将进行权重衰减，否则不进行。
+        # 通常，矩阵乘法中的所有权重张量 + 嵌入层参数维度 >= 2，会进行衰减；所有偏置和层归一化参数维度 < 2，不会衰减。
         decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
         nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        # 构建优化器的参数组，分别设置需要衰减和不需要衰减的参数组及其权重衰减系数
         optim_groups = [
             {'params': decay_params, 'weight_decay': weight_decay},
             {'params': nodecay_params, 'weight_decay': 0.0}
         ]
+        # 计算需要衰减的参数总数
         num_decay_params = sum(p.numel() for p in decay_params)
+        # 计算不需要衰减的参数总数
         num_nodecay_params = sum(p.numel() for p in nodecay_params)
+        # 打印需要衰减的参数张量数量和参数总数
         print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+        # 打印不需要衰减的参数张量数量和参数总数
         print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
-        # Create AdamW optimizer and use the fused version if it is available
+        # 检查当前 PyTorch 的 AdamW 优化器是否支持 fused 版本
         fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        # 判断是否使用 fused 版本的优化器，条件是支持 fused 且设备类型为 cuda
         use_fused = fused_available and device_type == 'cuda'
+        # 根据是否使用 fused 版本，构建额外的参数
         extra_args = dict(fused=True) if use_fused else dict()
+        # 创建 AdamW 优化器实例，传入参数组、学习率、动量参数和额外参数
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
+        # 打印是否使用了 fused 版本的 AdamW 优化器
         print(f"using fused AdamW: {use_fused}")
 
         return optimizer
@@ -411,6 +441,15 @@ class GPT(nn.Module):
         该函数会根据条件序列生成 max_new_tokens 个新的标记，
         并将生成的标记反馈到模型中，以进行下一次预测。
         通常,在使用此函数时,模型应该处于评估模式(model.eval()）。
+
+        参数:
+        idx (torch.LongTensor): 条件索引序列，形状为 (b, t)，b 为批次大小，t 为序列长度。
+        max_new_tokens (int): 需要生成的新标记数量。
+        temperature (float, 可选): 用于控制生成文本随机性的温度系数，默认值为 1.0。
+                                值越大，生成文本越随机；值越小，生成文本越确定。
+        top_k (int, 可选): 用于 top-k 采样的参数，若指定，则仅从概率最高的 k 个标记中采样，默认值为 None。
+        返回:
+        torch.LongTensor: 包含原始序列和新生成标记的索引序列。
         """
         for _ in range(max_new_tokens):
             # 如果序列上下文变得过长，我们必须将其裁剪为 block_size 的长度
