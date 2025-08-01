@@ -22,7 +22,9 @@ val_data = data[int(n*0.9):]
 
 # encode with tiktoken gpt2 bpe
 enc = tiktoken.get_encoding("gpt2")
+# 使用之前初始化的 tiktoken 编码器 enc，对训练数据进行编码，将文本数据转换为 token ID 列表
 train_ids = enc.encode_ordinary(train_data)
+# 使用相同的编码器对验证数据进行编码，将文本数据转换为 token ID 列表
 val_ids = enc.encode_ordinary(val_data)
 print(f"train has {len(train_ids):,} tokens")
 print(f"val has {len(val_ids):,} tokens")
