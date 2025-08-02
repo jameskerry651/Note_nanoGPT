@@ -44,9 +44,9 @@ wandb_log = False # 默认禁用
 wandb_project = 'owt'
 wandb_run_name = 'gpt2' # 'run' + str(time.time())
 # 数据
-dataset = 'openwebtext'
+dataset = 'shakespeare'
 gradient_accumulation_steps = 5 * 8 # 用于模拟更大的批量大小
-batch_size = 12 # 如果 gradient_accumulation_steps > 1，这是微批量大小
+batch_size = 4 # 如果 gradient_accumulation_steps > 1，这是微批量大小
 block_size = 1024
 # 模型
 n_layer = 12
