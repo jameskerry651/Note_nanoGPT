@@ -258,18 +258,28 @@ def estimate_loss():
     model.train()
     return out
 
-# learning rate decay scheduler (cosine with warmup)
+# 学习率衰减调度器（带热身阶段的余弦衰减策略）
+# 此函数根据当前迭代次数 it 计算并返回对应的学习率。该策略包含三个阶段：
+# 1. 热身阶段：在 warmup_iters 步内线性增加学习率
+# 2. 衰减阶段：在 warmup_iters 到 lr_decay_iters 步之间使用余弦函数衰减学习率
+# 3. 稳定阶段：在 lr_decay_iters 步之后保持最小学习率
 def get_lr(it):
-    # 1) linear warmup for warmup_iters steps
+    # 1) 热身阶段：在 warmup_iters 步内线性增加学习率
+    # 从 0 开始逐步增加到初始学习率 learning_rate
     if it < warmup_iters:
         return learning_rate * (it + 1) / (warmup_iters + 1)
-    # 2) if it > lr_decay_iters, return min learning rate
+    # 2) 如果当前迭代次数超过 lr_decay_iters，返回最小学习率 min_lr
     if it > lr_decay_iters:
         return min_lr
-    # 3) in between, use cosine decay down to min learning rate
+    # 3) 在热身阶段和衰减结束之间，使用余弦衰减策略将学习率降到最小学习率
+    # 计算当前迭代次数在衰减阶段的比例，范围在 0 到 1 之间
     decay_ratio = (it - warmup_iters) / (lr_decay_iters - warmup_iters)
+    # 确保衰减比例在有效范围内
     assert 0 <= decay_ratio <= 1
-    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff ranges 0..1
+    # 使用余弦函数计算衰减系数，范围在 0 到 1 之间
+    # 随着迭代次数增加，系数从 1 逐渐减小到 0
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))  # coeff 范围 0..1
+    # 根据衰减系数计算当前学习率，从初始学习率逐渐衰减到最小学习率
     return min_lr + coeff * (learning_rate - min_lr)
 
 # logging
@@ -277,89 +287,116 @@ if wandb_log and master_process:
     import wandb
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
-# training loop
-X, Y = get_batch('train') # fetch the very first batch
-t0 = time.time()
-local_iter_num = 0 # number of iterations in the lifetime of this process
-raw_model = model.module if ddp else model # unwrap DDP container if needed
-running_mfu = -1.0
-while True:
+# 训练循环：不断迭代进行模型训练，直到满足终止条件
+X, Y = get_batch('train')  # 获取第一个训练批次的数据，X 为输入序列，Y 为目标序列
+t0 = time.time()  # 记录当前时间，用于后续计算每个迭代的耗时
+local_iter_num = 0  # 记录当前进程生命周期内的迭代次数
+# 如果使用了分布式数据并行（DDP），则通过 model.module 获取原始模型；否则直接使用 model
+raw_model = model.module if ddp else model 
+running_mfu = -1.0  # 初始化运行时的模型利用率（MFU），-1.0 表示尚未计算
 
-    # determine and set the learning rate for this iteration
+while True:
+    # 根据当前迭代次数确定本次迭代的学习率
+    # 如果开启了学习率衰减（decay_lr 为 True），则调用 get_lr 函数计算学习率
+    # 否则使用初始设置的学习率 learning_rate
     lr = get_lr(iter_num) if decay_lr else learning_rate
+    # 遍历优化器的参数组，将计算得到的学习率应用到每个参数组中
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
 
-    # evaluate the loss on train/val sets and write checkpoints
+    # 评估模型在训练集和验证集上的损失，并在必要时保存模型检查点
+    # 检查当前迭代次数是否达到评估间隔，并且当前进程是否为主进程
+    # 只有在满足这两个条件时，才会进行模型评估和保存检查点等操作
+    # 这样设计是为了避免多个进程重复进行评估和日志记录，减轻计算负担
     if iter_num % eval_interval == 0 and master_process:
+        # 调用 estimate_loss 函数评估模型在训练集和验证集上的损失
+        # 该函数会返回一个字典，包含 'train' 和 'val' 两个键，分别对应训练集和验证集的损失
         losses = estimate_loss()
+        # 打印当前迭代次数下，模型在训练集和验证集上的损失
+        # 保留四位小数，方便观察模型的训练效果
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+
+        # 检查是否启用了 wandb 日志记录功能
+        # 如果启用了，将当前迭代次数、训练集损失、验证集损失、学习率和模型利用率记录到 wandb 中
         if wandb_log:
             wandb.log({
-                "iter": iter_num,
-                "train/loss": losses['train'],
-                "val/loss": losses['val'],
-                "lr": lr,
-                "mfu": running_mfu*100, # convert to percentage
+                "iter": iter_num,  # 当前迭代次数
+                "train/loss": losses['train'],  # 训练集损失
+                "val/loss": losses['val'],  # 验证集损失
+                "lr": lr,  # 当前学习率
+                "mfu": running_mfu*100, # 将模型利用率转换为百分比后记录
             })
+
+        # 检查当前验证集损失是否小于之前记录的最佳验证集损失，或者是否设置了总是保存检查点
+        # 如果满足任一条件，则更新最佳验证集损失，并保存模型检查点
         if losses['val'] < best_val_loss or always_save_checkpoint:
+            # 更新最佳验证集损失为当前验证集损失
             best_val_loss = losses['val']
+            # 确保当前迭代次数大于 0，避免在初始迭代时保存空的检查点
             if iter_num > 0:
+                # 创建一个字典，包含模型的状态字典、优化器的状态字典、模型参数、当前迭代次数、最佳验证集损失和配置信息
+                # 这些信息将用于后续恢复训练
                 checkpoint = {
-                    'model': raw_model.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'model_args': model_args,
-                    'iter_num': iter_num,
-                    'best_val_loss': best_val_loss,
-                    'config': config,
+                    'model': raw_model.state_dict(),  # 模型的状态字典，包含模型的所有参数
+                    'optimizer': optimizer.state_dict(),  # 优化器的状态字典，包含优化器的所有参数
+                    'model_args': model_args,  # 模型的配置参数
+                    'iter_num': iter_num,  # 当前迭代次数
+                    'best_val_loss': best_val_loss,  # 最佳验证集损失
+                    'config': config,  # 训练配置信息
                 }
+                # 打印保存检查点的信息，提示用户当前正在保存检查点
                 print(f"saving checkpoint to {out_dir}")
+                # 将检查点字典保存到指定的文件中
                 torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+
+    # 检查当前是否为第一次迭代，并且是否设置了仅评估模式
+    # 如果满足这两个条件，说明用户只想评估模型，不进行训练，因此跳出训练循环
     if iter_num == 0 and eval_only:
         break
 
-    # forward backward update, with optional gradient accumulation to simulate larger batch size
-    # and using the GradScaler if data type is float16
+    # 前向传播、反向传播和参数更新，可选择使用梯度累积来模拟更大的批量大小
+    # 如果数据类型为 float16，则使用梯度缩放器
     for micro_step in range(gradient_accumulation_steps):
         if ddp:
-            # in DDP training we only need to sync gradients at the last micro step.
-            # the official way to do this is with model.no_sync() context manager, but
-            # I really dislike that this bloats the code and forces us to repeat code
-            # looking at the source of that context manager, it just toggles this variable
+            # 在 DDP 训练中，我们只需要在最后一个微步同步梯度。
+            # 官方的做法是使用 model.no_sync() 上下文管理器，但是
+            # 我不太喜欢这种做法，因为它会让代码变得臃肿，还迫使我们重复编写代码
+            # 查看该上下文管理器的源码，它只是切换了这个变量的值
+            # 因此，我选择手动设置这个变量的值，以实现相同的效果
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
             logits, loss = model(X, Y)
-            loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
-        # immediately async prefetch next batch while model is doing the forward pass on the GPU
+            loss = loss / gradient_accumulation_steps # 缩放损失以考虑梯度累积
+        # 当模型在 GPU 上进行前向传播时，立即异步预取下一批数据
         X, Y = get_batch('train')
-        # backward pass, with gradient scaling if training in fp16
+        # 反向传播，如果使用 fp16 训练则进行梯度缩放
         scaler.scale(loss).backward()
-    # clip the gradient
+    # 裁剪梯度
     if grad_clip != 0.0:
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-    # step the optimizer and scaler if training in fp16
+    # 如果使用 fp16 进行训练，更新优化器和梯度缩放器
     scaler.step(optimizer)
     scaler.update()
-    # flush the gradients as soon as we can, no need for this memory anymore
+    # 尽快清除梯度，不再需要这些内存
     optimizer.zero_grad(set_to_none=True)
 
-    # timing and logging
+    # 计时和日志记录
     t1 = time.time()
     dt = t1 - t0
     t0 = t1
     if iter_num % log_interval == 0 and master_process:
-        # get loss as float. note: this is a CPU-GPU sync point
-        # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
+        # 获取浮点数格式的损失值。注意：这是一个 CPU-GPU 同步点
+        # 放大损失值以抵消上面的除法操作，近似得到真实的总损失（精确值应该是求和）
         lossf = loss.item() * gradient_accumulation_steps
-        if local_iter_num >= 5: # let the training loop settle a bit
+        if local_iter_num >= 5: # 让训练循环稍微稳定一下
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
         print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
     iter_num += 1
     local_iter_num += 1
 
-    # termination conditions
+    # 终止条件
     if iter_num > max_iters:
         break
 
