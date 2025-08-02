@@ -30,85 +30,111 @@ from torch.distributed import init_process_group, destroy_process_group
 from model import GPTConfig, GPT
 
 # -----------------------------------------------------------------------------
-# default config values designed to train a gpt2 (124M) on OpenWebText
+# 用于在 OpenWebText 上训练 gpt2 (124M) 的默认配置值
 # I/O
 out_dir = 'out'
 eval_interval = 2000
 log_interval = 1
 eval_iters = 200
-eval_only = False # if True, script exits right after the first eval
-always_save_checkpoint = True # if True, always save a checkpoint after each eval
-init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
-# wandb logging
-wandb_log = False # disabled by default
+eval_only = False # 如果为 True，脚本在第一次评估后立即退出
+always_save_checkpoint = True # 如果为 True，每次评估后总是保存一个检查点
+init_from = 'scratch' # 'scratch'（从头开始）、'resume'（从检查点恢复）或 'gpt2*'
+# wandb 日志记录
+wandb_log = False # 默认禁用
 wandb_project = 'owt'
 wandb_run_name = 'gpt2' # 'run' + str(time.time())
-# data
+# 数据
 dataset = 'openwebtext'
-gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
-batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
+gradient_accumulation_steps = 5 * 8 # 用于模拟更大的批量大小
+batch_size = 12 # 如果 gradient_accumulation_steps > 1，这是微批量大小
 block_size = 1024
-# model
+# 模型
 n_layer = 12
 n_head = 12
 n_embd = 768
-dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
-bias = False # do we use bias inside LayerNorm and Linear layers?
-# adamw optimizer
-learning_rate = 6e-4 # max learning rate
-max_iters = 600000 # total number of training iterations
+dropout = 0.0 # 预训练时设为 0 较好，微调时尝试 0.1 或更大的值
+bias = False # 在 LayerNorm 和 Linear 层中是否使用偏置？
+# adamw 优化器
+learning_rate = 6e-4 # 最大学习率
+max_iters = 600000 # 训练迭代的总次数
 weight_decay = 1e-1
 beta1 = 0.9
 beta2 = 0.95
-grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
-# learning rate decay settings
-decay_lr = True # whether to decay the learning rate
-warmup_iters = 2000 # how many steps to warm up for
-lr_decay_iters = 600000 # should be ~= max_iters per Chinchilla
-min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
-# DDP settings
+grad_clip = 1.0 # 在此值处裁剪梯度，如果为 0.0 则禁用
+# 学习率衰减设置
+decay_lr = True # 是否衰减学习率
+warmup_iters = 2000 # 预热的步数
+lr_decay_iters = 600000 # 根据 Chinchilla 论文，应约等于 max_iters
+min_lr = 6e-5 # 最小学习率，根据 Chinchilla 论文，应约等于 learning_rate/10
+# DDP (Distributed Data Parallel) 设置，用于指定分布式训练时的通信后端
+# 通信后端负责进程间的通信，常见的选项有 'nccl' 和 'gloo'
+# 'nccl'（NVIDIA Collective Communications Library）是 NVIDIA GPU 上进行高效通信的首选后端，支持多 GPU 间的快速通信
+# 'gloo' 是一个通用的通信后端，支持 CPU 和 GPU，通常用于调试或非 NVIDIA 硬件环境
+# 此处选择 'nccl' 作为通信后端
 backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = True # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
+# 筛选出全局变量中所有不以 '_' 开头，且类型为 int、float、bool 或 str 的变量名
+# 将这些变量名存储在 config_keys 列表中，这些变量后续会作为配置项使用
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
-exec(open('configurator.py').read()) # overrides from command line or config file
-config = {k: globals()[k] for k in config_keys} # will be useful for logging
+# 执行 'configurator.py' 文件中的代码，该文件可能包含从命令行或配置文件中读取的配置
+# 这些配置会覆盖当前脚本中已有的全局变量值
+exec(open('configurator.py').read()) 
+# 根据 config_keys 列表，从全局变量中提取对应的配置项及其值
+# 将这些配置项和值存储在 config 字典中，该字典后续可用于日志记录等操作
+config = {k: globals()[k] for k in config_keys} 
 # -----------------------------------------------------------------------------
 
-# various inits, derived attributes, I/O setup
-ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
+# 各种初始化、派生属性设置以及 I/O 设置
+ddp = int(os.environ.get('RANK', -1)) != -1 # 当前是否在进行分布式数据并行 (DDP) 训练？
 if ddp:
+    # 初始化分布式进程组，使用指定的通信后端
     init_process_group(backend=backend)
+    # 获取当前进程的全局排名，用于标识不同节点上的进程
     ddp_rank = int(os.environ['RANK'])
+    # 获取当前进程在本地节点上的排名，用于指定使用的 GPU 设备
     ddp_local_rank = int(os.environ['LOCAL_RANK'])
+    # 获取参与分布式训练的进程总数
     ddp_world_size = int(os.environ['WORLD_SIZE'])
+    # 设置当前进程使用的 GPU 设备
     device = f'cuda:{ddp_local_rank}'
+    # 将当前进程的默认 CUDA 设备设置为指定的 GPU
     torch.cuda.set_device(device)
-    master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
-    seed_offset = ddp_rank # each process gets a different seed
-    # world_size number of processes will be training simultaneously, so we can scale
-    # down the desired gradient accumulation iterations per process proportionally
+    # 判断当前进程是否为主进程，主进程负责日志记录、保存检查点等操作
+    master_process = ddp_rank == 0 
+    # 为每个进程设置不同的随机种子偏移量，确保训练的随机性
+    seed_offset = ddp_rank 
+    # 由于有 world_size 个进程同时进行训练，我们可以按比例缩小每个进程所需的梯度累积步数
+    # 这里需要确保梯度累积步数能被进程总数整除
     assert gradient_accumulation_steps % ddp_world_size == 0
     gradient_accumulation_steps //= ddp_world_size
 else:
-    # if not ddp, we are running on a single gpu, and one process
+    # 如果不是分布式训练，我们在单块 GPU 上运行，且只有一个进程
     master_process = True
+    # 单进程训练时，随机种子偏移量为 0
     seed_offset = 0
+    # 单进程训练时，进程总数为 1
     ddp_world_size = 1
 tokens_per_iter = gradient_accumulation_steps * ddp_world_size * batch_size * block_size
 print(f"tokens per iteration will be: {tokens_per_iter:,}")
 
 if master_process:
+    # 如果是主进程，创建输出目录，exist_ok=True 表示如果目录已存在则不会报错
     os.makedirs(out_dir, exist_ok=True)
+# 设置随机种子，加上 seed_offset 确保不同进程有不同的随机种子
 torch.manual_seed(1337 + seed_offset)
-torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
-torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
-device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
-# note: float16 data type will automatically use a GradScaler
+# 允许在矩阵乘法中使用 TF32 数据类型，TF32 能在保持一定精度的同时提升计算速度
+torch.backends.cuda.matmul.allow_tf32 = True 
+# 允许在 cuDNN 中使用 TF32 数据类型，以提升计算性能
+torch.backends.cudnn.allow_tf32 = True 
+# 判断当前设备类型，如果设备名包含 'cuda' 则为 'cuda'，否则为 'cpu'，后续用于 torch.autocast
+device_type = 'cuda' if 'cuda' in device else 'cpu' 
+# 注意：float16 数据类型会自动使用梯度缩放器（GradScaler）
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
+# 如果使用 CPU 设备，则不进行自动混合精度训练；否则使用 torch.amp.autocast 进行自动混合精度训练
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
 # poor man's data loader
@@ -120,14 +146,19 @@ def get_batch(split):
         data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
     else:
         data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
-    ix = torch.randint(len(data) - block_size, (batch_size,))
+    # 从数据中随机抽取 batch_size 个样本的起始索引
+    ix = torch.randint(len(data) - block_size, (batch_size,)) # 生成 batch_size 个随机整数，范围在 [0, len(data) - block_size) 之间
+    # 根据起始索引 ix 从数据中提取输入序列 x 和目标序列 y
     x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
     y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
     if device_type == 'cuda':
-        # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
+        # 固定数组 x 和 y，这样可以异步地将它们移动到 GPU 上（non_blocking=True）
+        # .pin_memory(): 这是一个性能优化。它将张量数据锁在 CPU 的“固定内存”（Pinned Memory）中。被固定的内存可以更快地被复制到 GPU。
         x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
     else:
         x, y = x.to(device), y.to(device)
+
+    # 返回输入序列 x 和目标序列 y，其形状均为 (batch_size, block_size)
     return x, y
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
@@ -161,16 +192,16 @@ elif init_from == 'resume':
     ckpt_path = os.path.join(out_dir, 'ckpt.pt')
     checkpoint = torch.load(ckpt_path, map_location=device)
     checkpoint_model_args = checkpoint['model_args']
-    # force these config attributes to be equal otherwise we can't even resume training
-    # the rest of the attributes (e.g. dropout) can stay as desired from command line
+    # 强制这些配置属性保持一致，否则无法恢复训练
+    # 其余属性（例如 dropout）可以保持命令行中指定的值
     for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
         model_args[k] = checkpoint_model_args[k]
-    # create the model
+    # 创建模型
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
     state_dict = checkpoint['model']
-    # fix the keys of the state dictionary :(
-    # honestly no idea how checkpoints sometimes get this prefix, have to debug more
+    # 修复状态字典的键 :(
+    # 说实话，不清楚检查点有时为何会有这个前缀，需要进一步调试
     unwanted_prefix = '_orig_mod.'
     for k,v in list(state_dict.items()):
         if k.startswith(unwanted_prefix):
@@ -180,38 +211,38 @@ elif init_from == 'resume':
     best_val_loss = checkpoint['best_val_loss']
 elif init_from.startswith('gpt2'):
     print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
-    # initialize from OpenAI GPT-2 weights
+    # 从 OpenAI GPT-2 的权重初始化
     override_args = dict(dropout=dropout)
     model = GPT.from_pretrained(init_from, override_args)
-    # read off the created config params, so we can store them into checkpoint correctly
+    # 读取创建的配置参数，以便我们能正确地将它们存储到检查点中
     for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
         model_args[k] = getattr(model.config, k)
-# crop down the model block size if desired, using model surgery
+# 如果需要，使用模型手术缩小模型的块大小
 if block_size < model.config.block_size:
     model.crop_block_size(block_size)
-    model_args['block_size'] = block_size # so that the checkpoint will have the right value
+    model_args['block_size'] = block_size # 确保检查点中的值是正确的
 model.to(device)
 
-# initialize a GradScaler. If enabled=False scaler is a no-op
+# 初始化一个梯度缩放器。如果 enabled=False，缩放器不执行任何操作
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
 
-# optimizer
+# 优化器
 optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
 if init_from == 'resume':
     optimizer.load_state_dict(checkpoint['optimizer'])
-checkpoint = None # free up memory
+checkpoint = None # 释放内存
 
-# compile the model
+# 编译模型
 if compile:
     print("compiling the model... (takes a ~minute)")
     unoptimized_model = model
     model = torch.compile(model) # requires PyTorch 2.0
 
-# wrap model into DDP container
+# 将模型包装到 DDP 容器中
 if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
 
-# helps estimate an arbitrarily accurate loss over either split using many batches
+# 有助于使用多个批次对任一数据分割集估算任意精度的损失
 @torch.no_grad()
 def estimate_loss():
     out = {}
